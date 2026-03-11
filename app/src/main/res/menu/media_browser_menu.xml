@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<menu xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto">
+
+    <!-- Tab switcher button — always visible in toolbar -->
+    <item
+        android:id="@+id/tab_count"
+        android:title="@string/new_tab"
+        app:actionLayout="@layout/menu_tab_count"
+        app:showAsAction="always" />
+
+    <item
+        android:id="@+id/nav_back"
+        android:title="@string/back"
+        app:showAsAction="never" />
+
+    <item
+        android:id="@+id/nav_forward"
+        android:title="@string/forward"
+        app:showAsAction="never" />
+
+    <item
+        android:id="@+id/nav_reload"
+        android:title="@string/reload"
+        app:showAsAction="never" />
+
+    <item
+        android:id="@+id/new_tab_menu"
+        android:title="@string/new_tab"
+        app:showAsAction="never" />
+
+</menu>

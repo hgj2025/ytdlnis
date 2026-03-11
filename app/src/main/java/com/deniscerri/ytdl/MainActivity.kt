@@ -172,6 +172,9 @@ class MainActivity : BaseActivity() {
                         val intent = Intent(context, SettingsActivity::class.java)
                         startActivity(intent)
                     }
+                    R.id.mediaBrowserFragment -> {
+                        // No-op on reselect (stay in browser)
+                    }
                 }
             }
 

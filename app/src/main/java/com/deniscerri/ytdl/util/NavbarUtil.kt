@@ -24,10 +24,10 @@ object NavbarUtil {
 
     private var navItems = mapOf(
         "Home" to R.id.homeFragment,
+        "Pages" to R.id.mediaBrowserFragment,
         "History" to R.id.historyFragment,
-        "Queue" to R.id.downloadQueueMainFragment,
-        "Terminal" to R.id.terminalActivity,
-        "More" to R.id.moreFragment
+        "More" to R.id.moreFragment,
+        "Queue" to R.id.downloadQueueMainFragment
     )
 
     fun getStartFragmentId(context: Context) : Int {
@@ -81,7 +81,7 @@ object NavbarUtil {
 
     private fun getNavBarPrefs(): List<String> {
         return settings
-            .getString("navigation_bar", "0,1,2,-3,-4")!!
+            .getString("navigation_bar", "0,1,2,3,-4")!!
             .split(",")
     }
 

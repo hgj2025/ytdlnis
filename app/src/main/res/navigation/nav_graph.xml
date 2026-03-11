@@ -82,6 +82,17 @@
             android:id="@+id/action_moreFragment_to_observeSourcesFragment"
             app:destination="@id/observeSourcesFragment" />
     </fragment>
+    <fragment
+        android:id="@+id/mediaBrowserFragment"
+        android:name="com.deniscerri.ytdl.ui.browser.MediaBrowserFragment"
+        android:label="@string/pages">
+        <action
+            android:id="@+id/action_mediaBrowserFragment_to_downloadBottomSheetDialog"
+            app:destination="@id/downloadBottomSheetDialog" />
+        <action
+            android:id="@+id/action_mediaBrowserFragment_to_downloadMultipleBottomSheetDialog"
+            app:destination="@id/downloadMultipleBottomSheetDialog2" />
+    </fragment>
     <activity
         android:id="@+id/terminalActivity"
         android:name="com.deniscerri.ytdl.ui.more.terminal.TerminalActivity"

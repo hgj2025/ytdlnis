@@ -57,6 +57,7 @@ import com.deniscerri.ytdl.database.viewmodel.HistoryViewModel
 import com.deniscerri.ytdl.database.viewmodel.ResultViewModel
 import com.deniscerri.ytdl.ui.adapter.HomeAdapter
 import com.deniscerri.ytdl.ui.adapter.SearchSuggestionsAdapter
+import com.deniscerri.ytdl.ui.browser.MediaBrowserActivity
 import com.deniscerri.ytdl.ui.more.cookies.WebViewActivity
 import com.deniscerri.ytdl.util.Extensions.enableFastScroll
 import com.deniscerri.ytdl.util.Extensions.isURL
@@ -178,6 +179,16 @@ class HomeFragment : Fragment(), HomeAdapter.OnItemClickListener, SearchSuggesti
         playlistNameFilterChipGroup = view.findViewById(R.id.playlist_selection_chips)
 
         runCatching { materialToolbar!!.title = ThemeUtil.getStyledAppName(requireContext()) }
+        materialToolbar?.setOnMenuItemClickListener { item ->
+            when (item.itemId) {
+                R.id.action_settings -> {
+                    val intent = Intent(requireContext(), com.deniscerri.ytdl.ui.more.settings.SettingsActivity::class.java)
+                    startActivity(intent)
+                    true
+                }
+                else -> false
+            }
+        }
 
         homeAdapter =
             HomeAdapter(
@@ -311,7 +322,14 @@ class HomeFragment : Fragment(), HomeAdapter.OnItemClickListener, SearchSuggesti
                                     myIntent.putExtra("url", "https://${URL(queryList.first()).host}")
                                     cookiesFetchedResultLauncher.launch(myIntent)
                                 },
-                                closed = {}
+                                closed = {},
+                                openInBrowser = if (isSingleQueryAndURL) {
+                                    {
+                                        val intent = Intent(requireContext(), MediaBrowserActivity::class.java)
+                                        intent.putExtra(MediaBrowserActivity.EXTRA_URL, queryList.first())
+                                        mediaBrowserResultLauncher.launch(intent)
+                                    }
+                                } else null
                             )
                         }
                         resultViewModel.uiState.update {it.copy(errorMessage  = null) }
@@ -360,6 +378,43 @@ class HomeFragment : Fragment(), HomeAdapter.OnItemClickListener, SearchSuggesti
         if (result.resultCode == Activity.RESULT_OK) {
             sharedPreferences?.edit()?.putBoolean("use_cookies", true)?.apply()
             startSearch()
+        }
+    }
+
+    private var mediaBrowserResultLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            val mediaUrls = result.data?.getStringArrayListExtra(MediaBrowserActivity.RESULT_MEDIA_URLS)
+            val mediaUrl  = result.data?.getStringExtra(MediaBrowserActivity.RESULT_MEDIA_URL)
+            val dlType    = result.data?.getStringExtra(MediaBrowserActivity.RESULT_DOWNLOAD_TYPE)
+            val worstQ    = result.data?.getBooleanExtra(MediaBrowserActivity.RESULT_WORST_QUALITY, false) ?: false
+            val type      = DownloadType.valueOf(dlType ?: sharedPreferences!!.getString("preferred_download_type", "video")!!)
+
+            if (!mediaUrls.isNullOrEmpty() && mediaUrls.size > 1) {
+                // Batch download
+                lifecycleScope.launch(Dispatchers.IO) {
+                    val items = mediaUrls.map { url ->
+                        val item = downloadViewModel.createDownloadItemFromResult(
+                            result    = downloadViewModel.createEmptyResultItem(url),
+                            givenType = type
+                        )
+                        if (worstQ) item.format.format_id = "worst"
+                        item
+                    }
+                    downloadViewModel.queueDownloads(items)
+                }
+            } else if (!mediaUrl.isNullOrBlank()) {
+                lifecycleScope.launch {
+                    withContext(Dispatchers.Main) {
+                        showSingleDownloadSheet(
+                            resultItem = downloadViewModel.createEmptyResultItem(mediaUrl),
+                            type = type,
+                            disableUpdateData = true
+                        )
+                    }
+                }
+            }
         }
     }
 

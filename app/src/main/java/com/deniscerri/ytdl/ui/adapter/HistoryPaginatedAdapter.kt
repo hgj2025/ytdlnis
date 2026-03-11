@@ -107,12 +107,12 @@ class HistoryPaginatedAdapter(onItemClickListener: OnItemClickListener, activity
         author.text = item.author
 
         val length = card.findViewById<TextView>(R.id.length)
-        length.text = if(item.downloadPath.size == 1) item.duration else ""
+        val durationText = if(item.downloadPath.size == 1) item.duration else ""
+        length.text = if (durationText.isNotEmpty()) "$durationText  ·" else ""
+        length.visibility = if (durationText.isNotEmpty()) View.VISIBLE else View.GONE
 
-
-        // TIME DOWNLOADED  ----------------------------------
         val datetime = card.findViewById<TextView>(R.id.downloads_info_time)
-        datetime.text = SimpleDateFormat(android.text.format.DateFormat.getBestDateTimePattern(Locale.getDefault(), "ddMMMyyyy - HHmm"), Locale.getDefault()).format(item.time * 1000L)
+        datetime.text = SimpleDateFormat(android.text.format.DateFormat.getBestDateTimePattern(Locale.getDefault(), "ddMMMyyyy"), Locale.getDefault()).format(item.time * 1000L)
 
         // BUTTON ----------------------------------
         val btn = card.findViewById<FloatingActionButton>(R.id.downloads_download_button_type)

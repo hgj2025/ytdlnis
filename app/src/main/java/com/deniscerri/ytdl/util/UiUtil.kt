@@ -2035,7 +2035,7 @@ object UiUtil {
         }
     }
 
-    fun handleNoResults(context: Activity, message: String, url: String? = null, continueAnyway: Boolean = false, continued: () -> Unit, closed: () -> Unit, cookieFetch: () -> Unit) {
+    fun handleNoResults(context: Activity, message: String, url: String? = null, continueAnyway: Boolean = false, continued: () -> Unit, closed: () -> Unit, cookieFetch: () -> Unit, openInBrowser: (() -> Unit)? = null) {
         val errDialog = MaterialAlertDialogBuilder(context)
             .setTitle(R.string.no_results)
             .setMessage(message)
@@ -2057,7 +2057,11 @@ object UiUtil {
             }
         }
 
-
+        if (openInBrowser != null && !url.isNullOrBlank()) {
+            errDialog.setNegativeButton(R.string.open_in_browser) { d: DialogInterface?, _ : Int ->
+                openInBrowser()
+            }
+        }
 
         errDialog.setOnCancelListener {
             closed()

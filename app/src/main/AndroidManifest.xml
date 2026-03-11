@@ -488,6 +488,13 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".ui.browser.MediaBrowserActivity"
+            android:configChanges="locale|orientation|screenSize"
+            android:exported="false"
+            android:launchMode="standard"
+            android:windowSoftInputMode="adjustResize" />
+
         <receiver android:name=".receiver.CancelDownloadNotificationReceiver" />
         <receiver android:name=".receiver.CancelWorkReceiver" />
         <receiver android:name=".receiver.PauseDownloadNotificationReceiver" />
