@@ -18,26 +18,42 @@
         app:layout_constraintTop_toTopOf="parent" />
 
     <TextView
+        android:id="@+id/media_filename"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="12dp"
+        android:ellipsize="middle"
+        android:maxLines="1"
+        android:textSize="14sp"
+        android:textStyle="bold"
+        app:layout_constraintEnd_toStartOf="@id/download_btn"
+        app:layout_constraintStart_toEndOf="@id/media_type_icon"
+        app:layout_constraintTop_toTopOf="parent" />
+
+    <TextView
         android:id="@+id/media_extension"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_marginStart="12dp"
-        android:textSize="12sp"
+        android:textAllCaps="true"
+        android:textColor="?android:attr/textColorSecondary"
+        android:textSize="11sp"
         android:textStyle="bold"
         app:layout_constraintStart_toEndOf="@id/media_type_icon"
-        app:layout_constraintTop_toTopOf="parent" />
+        app:layout_constraintTop_toBottomOf="@id/media_filename" />
 
     <TextView
         android:id="@+id/media_url"
         android:layout_width="0dp"
         android:layout_height="wrap_content"
-        android:layout_marginStart="12dp"
+        android:layout_marginStart="6dp"
         android:ellipsize="end"
-        android:maxLines="2"
-        android:textSize="12sp"
+        android:maxLines="1"
+        android:textColor="?android:attr/textColorSecondary"
+        android:textSize="11sp"
+        app:layout_constraintBaseline_toBaselineOf="@id/media_extension"
         app:layout_constraintEnd_toStartOf="@id/download_btn"
-        app:layout_constraintStart_toEndOf="@id/media_type_icon"
-        app:layout_constraintTop_toBottomOf="@id/media_extension" />
+        app:layout_constraintStart_toEndOf="@id/media_extension" />
 
     <com.google.android.material.button.MaterialButton
         android:id="@+id/download_btn"

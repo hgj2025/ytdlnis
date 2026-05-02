@@ -49,8 +49,6 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONTokener
 import java.net.URI
-import java.util.concurrent.CopyOnWriteArraySet
-import java.util.concurrent.atomic.AtomicInteger
 
 class MediaBrowserFragment : Fragment() {
 
@@ -71,18 +69,13 @@ class MediaBrowserFragment : Fragment() {
     private lateinit var favoritesEmpty: TextView
     private lateinit var recentEmpty: TextView
 
-    // ── Tab state ─────────────────────────────────────────────────────────────
-    private val tabs = mutableListOf<BrowserTab>()
-    private var currentTab: BrowserTab? = null
-    private val nextTabId = AtomicInteger(0)
-
-    data class BrowserTab(
-        val id: Int,
-        val webView: WebView,
-        var url: String = "",
-        var title: String = "New Tab",
-        val interceptedUrls: CopyOnWriteArraySet<String> = CopyOnWriteArraySet()
-    )
+    // ── Tab state (backed by Activity-scoped ViewModel so WebViews survive navigation) ──
+    private lateinit var browserViewModel: BrowserViewModel
+    private val tabs get() = browserViewModel.tabs
+    private var currentTab: BrowserTab?
+        get() = browserViewModel.currentTab
+        set(value) { browserViewModel.setCurrentTab(value) }
+    private val nextTabId get() = browserViewModel.nextTabId
 
     // ── Site data ─────────────────────────────────────────────────────────────
     data class SiteItem(val url: String, val domain: String, val title: String = domain)
@@ -107,7 +100,15 @@ class MediaBrowserFragment : Fragment() {
         "aac", "ogg", "flac", "wav", "opus", "mpd", "avi", "mov"
     )
     private val AUDIO_EXTENSIONS = setOf("mp3", "m4a", "aac", "ogg", "flac", "wav", "opus")
-    private val MEDIA_KEYWORDS = listOf("/manifest", "/stream", "video/", "audio/")
+    // Hard reject these — pages send "Accept: video/*,*/*" for non-media subresources
+    // (e.g. preload-tagged JS), so we can't trust headers alone.
+    private val NON_MEDIA_EXTENSIONS = setOf(
+        "js", "mjs", "css", "html", "htm", "json", "xml", "svg",
+        "png", "jpg", "jpeg", "gif", "webp", "ico", "bmp", "avif",
+        "woff", "woff2", "ttf", "otf", "eot", "txt", "pdf", "map",
+        "wasm", "zip", "gz"
+    )
+    private val MEDIA_KEYWORDS = listOf("/manifest", "video/", "audio/")
 
     private val SCAN_JS = """
         (function() {
@@ -158,8 +159,9 @@ class MediaBrowserFragment : Fragment() {
     override fun onViewCreated(view: View, savedInstanceState: Bundle?) {
         super.onViewCreated(view, savedInstanceState)
 
-        downloadViewModel     = ViewModelProvider(requireActivity())[DownloadViewModel::class.java]
-        downloadCardViewModel = ViewModelProvider(requireActivity())[DownloadCardViewModel::class.java]
+        browserViewModel        = ViewModelProvider(requireActivity())[BrowserViewModel::class.java]
+        downloadViewModel       = ViewModelProvider(requireActivity())[DownloadViewModel::class.java]
+        downloadCardViewModel   = ViewModelProvider(requireActivity())[DownloadCardViewModel::class.java]
 
         drawerLayout     = view.findViewById(R.id.drawer_layout)
         webviewContainer = view.findViewById(R.id.webview_container)
@@ -184,7 +186,22 @@ class MediaBrowserFragment : Fragment() {
         setFabState(hasMedia = false)
         setupHomePage()
 
-        if (savedInstanceState != null) {
+        if (tabs.isNotEmpty()) {
+            // Reattach existing WebViews from ViewModel (navigated back from another tab).
+            // Only refresh callbacks that reference fragment views — do NOT call
+            // addJavascriptInterface again, which would trigger a page reload.
+            tabs.forEach { tab ->
+                (tab.webView.parent as? ViewGroup)?.removeView(tab.webView)
+                refreshWebViewCallbacks(tab)
+                webviewContainer.addView(tab.webView, FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT
+                ))
+                tab.webView.visibility = View.GONE
+            }
+            val cur = currentTab ?: tabs.first()
+            switchToTab(cur)
+        } else if (savedInstanceState != null) {
             val urls = savedInstanceState.getStringArrayList("tab_urls") ?: arrayListOf("about:blank")
             val cur  = savedInstanceState.getInt("current_tab_index", 0)
             urls.forEachIndexed { i, url -> createTab(url, switchTo = (i == cur)) }
@@ -200,9 +217,9 @@ class MediaBrowserFragment : Fragment() {
     }
 
     override fun onDestroyView() {
-        tabs.forEach { it.webView.destroy() }
-        tabs.clear()
-        currentTab = null
+        // Detach WebViews from the container but keep them alive in the ViewModel
+        // so they can be reattached when the user navigates back to this tab.
+        webviewContainer.removeAllViews()
         super.onDestroyView()
     }
 
@@ -232,14 +249,41 @@ class MediaBrowserFragment : Fragment() {
     private fun setupUrlBar() {
         urlEditText.setOnEditorActionListener { _, actionId, _ ->
             if (actionId == EditorInfo.IME_ACTION_GO) {
-                val input = urlEditText.text?.toString()?.trim() ?: ""
-                val url   = if (input.startsWith("http")) input else "https://$input"
-                currentTab?.webView?.loadUrl(url)
+                loadInCurrentTab(urlEditText.text?.toString().orEmpty())
                 true
             } else false
         }
         requireView().findViewById<ImageButton>(R.id.btn_reload)
             .setOnClickListener { currentTab?.webView?.reload() }
+    }
+
+    private fun loadInCurrentTab(input: String) {
+        loadInTab(currentTab ?: return, normalizeUrl(input))
+    }
+
+    /** All user-initiated loads should go through here so the www-retry flag resets. */
+    private fun loadInTab(tab: BrowserTab, url: String) {
+        tab.wwwRetried = false
+        tab.webView.loadUrl(url)
+    }
+
+    /**
+     * Accepts what the user typed and returns a loadable URL.
+     * - Already-schemed URLs pass through.
+     * - Bare hosts (anything with a dot or `localhost`) get `https://` prepended.
+     * - Anything else is treated as a search query.
+     */
+    private fun normalizeUrl(input: String): String {
+        val trimmed = input.trim()
+        if (trimmed.isEmpty()) return "about:blank"
+        if (trimmed.matches(Regex("^[a-z][a-z0-9+\\-.]*://.*", RegexOption.IGNORE_CASE))) {
+            return trimmed
+        }
+        val looksLikeHost = !trimmed.contains(' ') &&
+            (trimmed.contains('.') || trimmed.equals("localhost", ignoreCase = true))
+        if (looksLikeHost) return "https://$trimmed"
+        val query = java.net.URLEncoder.encode(trimmed, "UTF-8")
+        return "https://www.google.com/search?q=$query"
     }
 
     private fun setupBackHandler() {
@@ -313,7 +357,7 @@ class MediaBrowserFragment : Fragment() {
         recentRecycler.layoutManager = GridLayoutManager(requireContext(), 4)
 
         favoritesRecycler.adapter = SiteAdapter(favoriteSites,
-            onClick = { site -> currentTab?.webView?.loadUrl(site.url) },
+            onClick = { site -> currentTab?.let { loadInTab(it, site.url) } },
             onLongClick = { site ->
                 MaterialAlertDialogBuilder(requireContext())
                     .setTitle(site.domain)
@@ -327,7 +371,7 @@ class MediaBrowserFragment : Fragment() {
         )
 
         recentRecycler.adapter = SiteAdapter(recentSites,
-            onClick = { site -> currentTab?.webView?.loadUrl(site.url) },
+            onClick = { site -> currentTab?.let { loadInTab(it, site.url) } },
             onLongClick = { site ->
                 val items = mutableListOf(getString(R.string.add_to_favorites), getString(R.string.remove_from_recent))
                 MaterialAlertDialogBuilder(requireContext())
@@ -443,7 +487,7 @@ class MediaBrowserFragment : Fragment() {
     private fun createTab(url: String, switchTo: Boolean = true): BrowserTab {
         val webView = WebView(requireContext())
         val tab = BrowserTab(id = nextTabId.getAndIncrement(), webView = webView, url = url)
-        configureWebView(tab)
+        initWebView(tab)
 
         webviewContainer.addView(webView, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT,
@@ -452,14 +496,15 @@ class MediaBrowserFragment : Fragment() {
         webView.visibility = View.GONE
         tabs.add(tab)
 
-        if (url != "about:blank") webView.loadUrl(url) else tab.title = getString(R.string.new_tab)
+        if (url != "about:blank") loadInTab(tab, url) else tab.title = getString(R.string.new_tab)
 
         if (switchTo) switchToTab(tab) else updateTabUi()
         return tab
     }
 
+    /** Full one-time setup: called only when creating a new tab. */
     @SuppressLint("SetJavaScriptEnabled")
-    private fun configureWebView(tab: BrowserTab) {
+    private fun initWebView(tab: BrowserTab) {
         val wv = tab.webView
         wv.settings.apply {
             javaScriptEnabled = true
@@ -467,19 +512,29 @@ class MediaBrowserFragment : Fragment() {
             javaScriptCanOpenWindowsAutomatically = true
             setSupportMultipleWindows(false)
         }
-
+        // JS interface is set once — re-adding it causes a page reload on many WebView versions.
         wv.addJavascriptInterface(object {
             @JavascriptInterface
             fun onMediaFound(url: String) {
-                if (url.startsWith("http")) {
+                if (url.startsWith("http") && isLikelyMedia(url)) {
                     val wasEmpty = tab.interceptedUrls.isEmpty()
                     tab.interceptedUrls.add(url)
                     if (wasEmpty && tab == currentTab) {
-                        requireActivity().runOnUiThread { setFabState(hasMedia = true) }
+                        activity?.runOnUiThread { if (isAdded) setFabState(hasMedia = true) }
                     }
                 }
             }
         }, "Android")
+        refreshWebViewCallbacks(tab)
+    }
+
+    /**
+     * Refresh only the callbacks that close over fragment-view references
+     * (WebViewClient, WebChromeClient, longClickListener). Safe to call every time
+     * the fragment view is recreated without causing a WebView reload.
+     */
+    private fun refreshWebViewCallbacks(tab: BrowserTab) {
+        val wv = tab.webView
 
         wv.webViewClient = object : WebViewClient() {
             override fun shouldInterceptRequest(
@@ -490,10 +545,46 @@ class MediaBrowserFragment : Fragment() {
                     val wasEmpty = tab.interceptedUrls.isEmpty()
                     tab.interceptedUrls.add(url)
                     if (wasEmpty && tab == currentTab) {
-                        requireActivity().runOnUiThread { setFabState(hasMedia = true) }
+                        activity?.runOnUiThread { if (isAdded) setFabState(hasMedia = true) }
                     }
                 }
                 return null
+            }
+
+            override fun doUpdateVisitedHistory(view: WebView?, url: String?, isReload: Boolean) {
+                super.doUpdateVisitedHistory(view, url, isReload)
+                // Fires on both full page loads and SPA pushState/replaceState navigations.
+                // Clear intercepted URLs whenever the page URL changes so stale media
+                // from previous pages doesn't appear in the download sheet.
+                if (!isReload && url != null && url != tab.url) {
+                    tab.interceptedUrls.clear()
+                    tab.url = url
+                    if (tab == currentTab) {
+                        activity?.runOnUiThread {
+                            if (!isAdded) return@runOnUiThread
+                            urlEditText.setText(if (url == "about:blank") "" else url)
+                            setFabState(hasMedia = false)
+                        }
+                    }
+                }
+            }
+
+            override fun onReceivedError(
+                view: WebView?,
+                request: WebResourceRequest?,
+                error: android.webkit.WebResourceError?
+            ) {
+                super.onReceivedError(view, request, error)
+                if (request?.isForMainFrame != true) return
+                val failed = request.url?.toString() ?: return
+                // Apex-domain DNS failure (e.g. "https://baidu.com" can't resolve in
+                // some networks) — retry once with "www." prepended. Stop after one
+                // retry so genuinely-broken hosts don't loop.
+                if (!tab.wwwRetried && shouldRetryWithWww(failed, error?.errorCode)) {
+                    tab.wwwRetried = true
+                    val retry = withWwwHost(failed) ?: return
+                    activity?.runOnUiThread { view?.loadUrl(retry) }
+                }
             }
 
             override fun onPageStarted(view: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
@@ -502,9 +593,15 @@ class MediaBrowserFragment : Fragment() {
                 tab.url = url
                 tab.interceptedUrls.clear()
                 if (tab == currentTab) {
-                    urlEditText.setText(if (url == "about:blank") "" else url)
-                    setFabState(hasMedia = false)
-                    updateHomePageVisibility()
+                    activity?.runOnUiThread {
+                        if (!isAdded) return@runOnUiThread
+                        urlEditText.setText(if (url == "about:blank") "" else url)
+                        urlEditText.clearFocus()
+                        val imm = requireContext().getSystemService(android.content.Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
+                        imm.hideSoftInputFromWindow(urlEditText.windowToken, 0)
+                        setFabState(hasMedia = false)
+                        updateHomePageVisibility()
+                    }
                 }
             }
 
@@ -513,14 +610,16 @@ class MediaBrowserFragment : Fragment() {
                 url?.let { tab.url = it }
                 view?.title?.takeIf { it.isNotBlank() }?.let { tab.title = it }
                 if (tab == currentTab) {
-                    urlEditText.setText(if (tab.url == "about:blank") "" else tab.url)
-                    setFabState(hasMedia = tab.interceptedUrls.isNotEmpty())
-                    updateHomePageVisibility()
+                    activity?.runOnUiThread {
+                        if (!isAdded) return@runOnUiThread
+                        urlEditText.setText(if (tab.url == "about:blank") "" else tab.url)
+                        setFabState(hasMedia = tab.interceptedUrls.isNotEmpty())
+                        updateHomePageVisibility()
+                    }
                 }
                 tabAdapter.notifyDataSetChanged()
                 wv.evaluateJavascript(OBSERVE_JS, null)
 
-                // Add to recent sites
                 if (url != null && url != "about:blank") {
                     addToRecent(url, tab.title)
                 }
@@ -531,7 +630,7 @@ class MediaBrowserFragment : Fragment() {
             override fun onReceivedTitle(view: WebView?, title: String?) {
                 if (!title.isNullOrBlank()) {
                     tab.title = title
-                    tabAdapter.notifyDataSetChanged()
+                    activity?.runOnUiThread { if (isAdded) tabAdapter.notifyDataSetChanged() }
                 }
             }
         }
@@ -606,7 +705,7 @@ class MediaBrowserFragment : Fragment() {
                 getString(R.string.open_background_tab)
             )) { _, which ->
                 when (which) {
-                    0 -> { currentTab?.webView?.loadUrl(url); currentTab?.let { it.url = url } }
+                    0 -> { currentTab?.let { loadInTab(it, url); it.url = url } }
                     1 -> createTab(url, switchTo = true)
                     2 -> createTab(url, switchTo = false)
                 }
@@ -616,46 +715,103 @@ class MediaBrowserFragment : Fragment() {
 
     // ── Media detection ───────────────────────────────────────────────────────
 
+    private fun shouldRetryWithWww(failedUrl: String, errorCode: Int?): Boolean {
+        val host = runCatching { URI(failedUrl).host }.getOrNull() ?: return false
+        if (host.startsWith("www.", ignoreCase = true)) return false
+        // Subdomained hosts (e.g. m.example.com, api.example.com) shouldn't get
+        // "www." prepended — only single-level apex domains like "example.com".
+        if (host.count { it == '.' } != 1) return false
+        // Limit retry to network-resolution failures; HTTP 4xx/5xx are app errors.
+        return errorCode == android.webkit.WebViewClient.ERROR_HOST_LOOKUP ||
+               errorCode == android.webkit.WebViewClient.ERROR_CONNECT ||
+               errorCode == android.webkit.WebViewClient.ERROR_TIMEOUT ||
+               errorCode == android.webkit.WebViewClient.ERROR_UNKNOWN
+    }
+
+    private fun withWwwHost(url: String): String? {
+        return runCatching {
+            val u = URI(url)
+            val newHost = "www.${u.host}"
+            URI(u.scheme, u.userInfo, newHost, u.port, u.path, u.query, u.fragment).toString()
+        }.getOrNull()
+    }
+
+    private fun urlExtension(url: String): String {
+        val path = url.lowercase().substringBefore('?').substringBefore('#')
+        // Take the last path segment first, then the extension within that segment.
+        // Doing it the other way around picks up dots in directory names like /api.v2/data.
+        return path.substringAfterLast('/').substringAfterLast('.', "")
+    }
+
     private fun isMediaUrl(url: String, request: WebResourceRequest?): Boolean {
-        val lower = url.lowercase()
-        val ext   = lower.substringAfterLast('.').substringBefore('?').substringBefore('#')
+        val ext = urlExtension(url)
+        if (ext in NON_MEDIA_EXTENSIONS) return false
         if (ext in MEDIA_EXTENSIONS) return true
-        if (MEDIA_KEYWORDS.any { lower.contains(it) }) return true
+        if (MEDIA_KEYWORDS.any { url.lowercase().contains(it) }) return true
+        // Accept-header fallback: only when there is no extension at all
+        // (extensionless streaming endpoints). Otherwise too many JS/CSS
+        // requests carry "Accept: */*" or wildcard headers and slip through.
+        if (ext.isNotEmpty()) return false
         val accept = request?.requestHeaders?.get("Accept") ?: ""
-        return accept.contains("video/", ignoreCase = true) ||
-               accept.contains("audio/", ignoreCase = true)
+        return accept.startsWith("video/", ignoreCase = true) ||
+               accept.startsWith("audio/", ignoreCase = true) ||
+               accept.contains("application/vnd.apple.mpegurl", ignoreCase = true) ||
+               accept.contains("application/dash+xml", ignoreCase = true)
+    }
+
+    private fun isLikelyMedia(url: String): Boolean {
+        val ext = urlExtension(url)
+        if (ext in NON_MEDIA_EXTENSIONS) return false
+        if (ext in MEDIA_EXTENSIONS) return true
+        return MEDIA_KEYWORDS.any { url.lowercase().contains(it) }
     }
 
     private fun collectAndShowMedia() {
         val tab = currentTab ?: return
         tab.webView.evaluateJavascript(SCAN_JS) { result ->
-            val merged = LinkedHashSet<String>(tab.interceptedUrls)
+            val merged = LinkedHashSet<String>()
+            tab.interceptedUrls.forEach { if (isLikelyMedia(it)) merged.add(it) }
             runCatching {
                 val jsonString = JSONTokener(result?.trim() ?: "\"[]\"").nextValue() as? String ?: "[]"
                 val json = JSONArray(jsonString)
                 for (i in 0 until json.length()) {
                     val u = json.optString(i)
-                    if (u.startsWith("http")) merged.add(u)
+                    if (u.startsWith("http") && isLikelyMedia(u)) merged.add(u)
                 }
             }
             val items = merged.map { toMediaItem(it) }
-            requireActivity().runOnUiThread { showMediaSheet(items) }
+            val pageTitle = tab.title.takeIf { it.isNotBlank() && it != "about:blank" }
+            activity?.runOnUiThread { if (isAdded) showMediaSheet(items, pageTitle) }
         }
     }
 
     private fun toMediaItem(url: String): MediaItem {
-        val ext = url.lowercase().substringAfterLast('/')
-            .substringAfterLast('.').substringBefore('?').substringBefore('#').take(6)
-        return MediaItem(url, ext.ifBlank { "?" }, ext in AUDIO_EXTENSIONS)
+        val path = url.substringBefore('?').substringBefore('#')
+        val lastSegment = path.substringAfterLast('/')
+        val ext = lastSegment.substringAfterLast('.', "").lowercase().take(6)
+        val decoded = runCatching { java.net.URLDecoder.decode(lastSegment, "UTF-8") }
+            .getOrDefault(lastSegment)
+        val filename = decoded.takeIf { it.isNotBlank() } ?: extractDomain(url) ?: url
+        return MediaItem(
+            url       = url,
+            filename  = filename,
+            extension = ext.ifBlank { "?" },
+            isAudio   = ext in AUDIO_EXTENSIONS
+        )
     }
 
-    private fun showMediaSheet(items: List<MediaItem>) {
+    private fun showMediaSheet(items: List<MediaItem>, pageTitle: String? = null) {
         if (items.isEmpty()) {
             Toast.makeText(requireContext(), R.string.no_media_found, Toast.LENGTH_SHORT).show()
             return
         }
 
         val view = layoutInflater.inflate(R.layout.bottomsheet_media_urls, null)
+
+        view.findViewById<TextView>(R.id.sheet_title)?.text =
+            pageTitle ?: getString(R.string.detected_media_urls)
+        view.findViewById<TextView>(R.id.sheet_subtitle)?.text =
+            "${items.size} · ${getString(R.string.detected_media_urls)}"
 
         // Batch actions (visible when > 1 item)
         val batchActions = view.findViewById<LinearLayout>(R.id.batch_actions)
@@ -729,17 +885,11 @@ class MediaBrowserFragment : Fragment() {
 
     private fun downloadSingleUrl(url: String) {
         val prefs = PreferenceManager.getDefaultSharedPreferences(requireContext())
-        val resultItem = downloadViewModel.createEmptyResultItem(url)
-        downloadCardViewModel.setResultItem(resultItem)
-        downloadCardViewModel.setDownloadItem(null)
-        val bundle = Bundle().apply {
-            putSerializable("type", downloadViewModel.getDownloadType(
-                DownloadType.valueOf(prefs.getString("preferred_download_type", "video")!!),
-                url
-            ))
-            putBoolean("disableUpdateData", true)
-        }
-        findNavController().navigate(R.id.action_mediaBrowserFragment_to_downloadBottomSheetDialog, bundle)
+        val type  = downloadViewModel.getDownloadType(
+            DownloadType.valueOf(prefs.getString("preferred_download_type", "video")!!),
+            url
+        )
+        downloadAllUrlsWithType(listOf(url), type, false)
     }
 
     private fun downloadAllUrls(urls: List<String>) {
@@ -795,7 +945,6 @@ class MediaBrowserFragment : Fragment() {
             holder.letter.text = firstChar.toString()
             holder.name.text = site.domain
 
-            // Color based on domain hash
             val colorIndex = (site.domain.hashCode() and 0x7FFFFFFF) % SITE_COLORS.size
             val bg = holder.circle.background
             if (bg is GradientDrawable) {
@@ -848,7 +997,12 @@ class MediaBrowserFragment : Fragment() {
         override fun getItemCount() = tabs.size
     }
 
-    data class MediaItem(val url: String, val extension: String, val isAudio: Boolean)
+    data class MediaItem(
+        val url: String,
+        val filename: String,
+        val extension: String,
+        val isAudio: Boolean
+    )
 
     private inner class MediaUrlAdapter(
         private val items: List<MediaItem>,
@@ -856,10 +1010,11 @@ class MediaBrowserFragment : Fragment() {
     ) : RecyclerView.Adapter<MediaUrlAdapter.VH>() {
 
         inner class VH(view: View) : RecyclerView.ViewHolder(view) {
-            val icon: ImageView = view.findViewById(R.id.media_type_icon)
-            val ext: TextView   = view.findViewById(R.id.media_extension)
-            val url: TextView   = view.findViewById(R.id.media_url)
-            val btn: View       = view.findViewById(R.id.download_btn)
+            val icon: ImageView     = view.findViewById(R.id.media_type_icon)
+            val filename: TextView  = view.findViewById(R.id.media_filename)
+            val ext: TextView       = view.findViewById(R.id.media_extension)
+            val url: TextView       = view.findViewById(R.id.media_url)
+            val btn: View           = view.findViewById(R.id.download_btn)
         }
 
         override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VH {
@@ -870,8 +1025,9 @@ class MediaBrowserFragment : Fragment() {
 
         override fun onBindViewHolder(holder: VH, position: Int) {
             val item = items[position]
-            holder.ext.text = item.extension.uppercase()
-            holder.url.text = try { java.net.URLDecoder.decode(item.url, "UTF-8") } catch (_: Exception) { item.url }
+            holder.filename.text = item.filename
+            holder.ext.text = item.extension
+            holder.url.text = extractDomain(item.url) ?: item.url
             holder.icon.setImageResource(
                 if (item.isAudio) R.drawable.baseline_audio_file_24
                 else R.drawable.baseline_video_file_24

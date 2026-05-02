@@ -87,7 +87,7 @@
         <!-- Action button -->
         <com.google.android.material.floatingactionbutton.FloatingActionButton
             android:id="@+id/downloads_download_button_type"
-            style="@style/Widget.Material3.FloatingActionButton.Small"
+            style="@style/Widget.Material3.FloatingActionButton.Small.Primary"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:contentDescription="@string/share"

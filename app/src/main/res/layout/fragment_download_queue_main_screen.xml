@@ -23,31 +23,76 @@
 
     </com.google.android.material.appbar.AppBarLayout>
 
-    <LinearLayout
-        app:layout_behavior="@string/appbar_scrolling_view_behavior"
+    <androidx.core.widget.NestedScrollView
+        android:id="@+id/queue_scroll"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
-        android:orientation="vertical">
+        android:fillViewport="true"
+        android:clipToPadding="false"
+        android:paddingBottom="100dp"
+        app:layout_behavior="@string/appbar_scrolling_view_behavior">
 
-        <com.google.android.material.tabs.TabLayout
-            android:id="@+id/download_tablayout"
+        <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginHorizontal="10dp"
-            android:layout_marginBottom="10dp"
-            android:backgroundTint="@android:color/transparent"
-            app:tabGravity="start"
-            app:tabMinWidth="0dp"
-            app:tabMode="scrollable" />
+            android:orientation="vertical">
 
-        <androidx.viewpager2.widget.ViewPager2
-            android:id="@+id/download_viewpager"
-            android:layout_width="match_parent"
-            android:layout_height="match_parent" />
-    </LinearLayout>
+            <TextView
+                android:id="@+id/header_active"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:paddingStart="20dp"
+                android:paddingEnd="20dp"
+                android:paddingTop="12dp"
+                android:paddingBottom="6dp"
+                android:text="@string/downloading"
+                android:textColor="?android:attr/textColorSecondary"
+                android:textSize="13sp"
+                android:textStyle="bold"
+                android:textAllCaps="true" />
+
+            <androidx.fragment.app.FragmentContainerView
+                android:id="@+id/active_container"
+                android:name="com.deniscerri.ytdl.ui.downloads.ActiveDownloadsFragment"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content" />
+
+            <TextView
+                android:id="@+id/empty_active"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:paddingStart="20dp"
+                android:paddingEnd="20dp"
+                android:paddingBottom="8dp"
+                android:text="@string/no_results"
+                android:textColor="?android:attr/textColorSecondary"
+                android:textSize="13sp"
+                android:visibility="gone" />
+
+            <TextView
+                android:id="@+id/header_queued"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:paddingStart="20dp"
+                android:paddingEnd="20dp"
+                android:paddingTop="16dp"
+                android:paddingBottom="6dp"
+                android:text="@string/in_queue"
+                android:textColor="?android:attr/textColorSecondary"
+                android:textSize="13sp"
+                android:textStyle="bold"
+                android:textAllCaps="true" />
+
+            <androidx.fragment.app.FragmentContainerView
+                android:id="@+id/queued_container"
+                android:name="com.deniscerri.ytdl.ui.downloads.QueuedDownloadsFragment"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content" />
+
+        </LinearLayout>
+    </androidx.core.widget.NestedScrollView>
 
     <include layout="@layout/no_results"
         android:visibility="gone" />
-
 
 </androidx.coordinatorlayout.widget.CoordinatorLayout>
