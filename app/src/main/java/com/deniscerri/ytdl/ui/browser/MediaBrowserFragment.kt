@@ -34,7 +34,12 @@ import androidx.preference.PreferenceManager
 import androidx.recyclerview.widget.GridLayoutManager
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
+import androidx.work.Data
+import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.WorkManager
 import com.deniscerri.ytdl.R
+import com.deniscerri.ytdl.work.DirectDownloadWorker
+import com.deniscerri.ytdl.work.ImageDownloadWorker
 import com.deniscerri.ytdl.database.enums.DownloadType
 import com.deniscerri.ytdl.database.viewmodel.DownloadCardViewModel
 import com.deniscerri.ytdl.database.viewmodel.DownloadViewModel
@@ -47,6 +52,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
+import org.json.JSONObject
 import org.json.JSONTokener
 import java.net.URI
 
@@ -110,6 +116,37 @@ class MediaBrowserFragment : Fragment() {
     )
     private val MEDIA_KEYWORDS = listOf("/manifest", "video/", "audio/")
 
+    // Ad/tracker networks that serve decoy or preview clips (e.g. tsyndicate's
+    // 30s teaser on rou.video). Never treat their media as the page's content.
+    private val AD_MEDIA_HOSTS = listOf(
+        "tsyndicate.com", "doubleclick.net", "googlesyndication.com",
+        "adnxs.com", "juicyads.com", "exoclick.com", "exosrv.com",
+        "trafficjunky.com", "trafficjunky.net", "popads.net", "popcash.net",
+        "adsterra.com", "hilltopads.net", "ad-maven.com", "mgid.com"
+    )
+
+    private fun isAdHost(url: String): Boolean {
+        val host = runCatching { URI(url).host?.lowercase() }.getOrNull() ?: return false
+        return AD_MEDIA_HOSTS.any { host == it || host.endsWith(".$it") }
+    }
+
+    // Progressive (single-file) media that can be fetched with one HTTP GET, so we
+    // download it immediately in-process (DirectDownloadWorker) instead of handing
+    // it to the yt-dlp queue. Streaming manifests (m3u8/mpd) and lone segments (ts)
+    // are excluded — those need yt-dlp to assemble the segments.
+    private val DIRECT_DOWNLOAD_EXTENSIONS = setOf(
+        "mp4", "webm", "mkv", "mov", "m4v", "avi",
+        "mp3", "m4a", "aac", "flac", "wav", "ogg", "opus"
+    )
+
+    // Request headers we never replay to yt-dlp: either set explicitly elsewhere
+    // (referer/cookie), managed by yt-dlp/the HTTP stack, or connection-specific.
+    private val SKIP_REPLAY_HEADERS = setOf(
+        "referer", "cookie", "range", "host", "connection", "content-length",
+        "accept-encoding", "accept-ranges", "if-modified-since", "if-none-match",
+        "upgrade-insecure-requests", "sec-fetch-mode", "sec-fetch-site", "sec-fetch-dest"
+    )
+
     private val SCAN_JS = """
         (function() {
           var urls = [], seen = {};
@@ -119,6 +156,13 @@ class MediaBrowserFragment : Fragment() {
           document.querySelectorAll('video,audio').forEach(function(e) {
             add(e.src); add(e.currentSrc);
             e.querySelectorAll('source').forEach(function(s){ add(s.src); });
+          });
+          document.querySelectorAll('source[src]').forEach(function(s){ add(s.src); });
+          // Custom JS players (e.g. hls.js) keep the real stream URL in a data-*
+          // attribute and only build a <video> with a blob: src on play, so the
+          // element scan above misses them. Pull those out directly.
+          ['data-source','data-src','data-video','data-hls','data-mp4','data-url'].forEach(function(attr){
+            document.querySelectorAll('['+attr+']').forEach(function(e){ add(e.getAttribute(attr)); });
           });
           return JSON.stringify(urls);
         })()
@@ -141,6 +185,147 @@ class MediaBrowserFragment : Fragment() {
               });
             });
           }).observe(document, {childList: true, subtree: true});
+
+          // Douyin (and similar) image-gallery posts have no <video>; the images
+          // come back in an aweme JSON API response. Parse those responses and,
+          // scoped to the opened post (modal_id), report the image URLs as a group.
+          function scanImages(text) {
+            try {
+              if (!text || text.indexOf('"images"') < 0 || text.indexOf('aweme_id') < 0) return;
+              var data = JSON.parse(text);
+              var modal = null;
+              try { modal = new URLSearchParams(location.search).get('modal_id'); } catch (e) {}
+              (function walk(o, d) {
+                if (!o || d > 6 || typeof o !== 'object') return;
+                if (o.aweme_id && o.images && o.images.length &&
+                    (!modal || String(o.aweme_id) === String(modal))) {
+                  var urls = [];
+                  o.images.forEach(function(im) {
+                    var l = im && im.url_list;
+                    if (l && l.length) urls.push(l[l.length - 1]);
+                  });
+                  if (urls.length) {
+                    try { Android.onImagesFound(JSON.stringify(
+                      { postId: String(o.aweme_id), title: (o.desc || ''), images: urls })); } catch (e) {}
+                  }
+                }
+                if (Array.isArray(o)) { for (var i = 0; i < o.length; i++) walk(o[i], d + 1); }
+                else { for (var k in o) { if (o[k] && typeof o[k] === 'object') walk(o[k], d + 1); } }
+              })(data, 0);
+            } catch (e) {}
+          }
+
+          // Many players (hls.js/dash.js) fetch the manifest via fetch()/XHR at
+          // play time and never put the stream URL in the DOM, so element scanning
+          // alone can't see it. Hook the network APIs: report requested URLs (media)
+          // and inspect aweme responses (images). Native side filters/handles both.
+          try {
+            var of = window.fetch;
+            if (of && !of.__ytdlnisHooked) {
+              window.fetch = function(input) {
+                var u = ''; try { u = typeof input === 'string' ? input : (input && input.url) || ''; } catch (e) {}
+                try { report(u); } catch (e) {}
+                var p = of.apply(this, arguments);
+                try {
+                  p.then(function(r) {
+                    try {
+                      if (u.indexOf('aweme') >= 0) {
+                        r.clone().text().then(scanImages).catch(function(){});
+                      } else {
+                        var cl = parseInt(r.headers.get('content-length') || '0', 10);
+                        if (cl > 0 && cl < 200000) {
+                          r.clone().text().then(function(tx) {
+                            if (tx.lastIndexOf('#EXTM3U', 0) === 0) { try { Android.onManifestFound(u); } catch (e) {} }
+                          }).catch(function(){});
+                        }
+                      }
+                    } catch (e) {}
+                  });
+                } catch (e) {}
+                return p;
+              };
+              window.fetch.__ytdlnisHooked = true;
+            }
+            var oo = XMLHttpRequest.prototype.open;
+            if (oo && !oo.__ytdlnisHooked) {
+              XMLHttpRequest.prototype.open = function(method, url) {
+                try { report(url); this.__ytU = url; } catch (e) {}
+                try {
+                  this.addEventListener('load', function() {
+                    try {
+                      var u = this.__ytU || this.responseURL || '';
+                      var t = null;
+                      if (this.responseType === '' || this.responseType === 'text') t = this.responseText;
+                      else if (this.responseType === 'json' && this.response) t = JSON.stringify(this.response);
+                      if (!t) return;
+                      // HLS playlist detected by content — catches m3u8 disguised as .jpg.
+                      if (t.lastIndexOf('#EXTM3U', 0) === 0) { try { Android.onManifestFound(u); } catch (e) {} }
+                      else if (u.indexOf('aweme') >= 0) scanImages(t);
+                    } catch (e) {}
+                  });
+                } catch (e) {}
+                return oo.apply(this, arguments);
+              };
+              XMLHttpRequest.prototype.open.__ytdlnisHooked = true;
+            }
+          } catch (e) {}
+
+          // Scroll-position memory. Native WebView back-scroll restoration only
+          // covers the document on a full reload; SPA sites (rou.video/Douyin) do
+          // client-side back (popstate, no reload) and scroll an inner container,
+          // so we remember every scroller's position per URL and restore on back.
+          try {
+            var scrollStore = {};
+            function scKey() { return location.pathname + location.search; }
+            function scSelector(el) {
+              if (!el || el === document || el === window ||
+                  el === document.documentElement || el === document.body) return '__win';
+              var path = [], depth = 0;
+              while (el && el.nodeType === 1 && depth < 6) {
+                var seg = el.tagName.toLowerCase();
+                if (el.id) { path.unshift(seg + '#' + el.id); return path.join('>'); }
+                var parent = el.parentNode;
+                if (parent && parent.children) {
+                  var idx = Array.prototype.indexOf.call(parent.children, el);
+                  seg += ':nth-child(' + (idx + 1) + ')';
+                }
+                path.unshift(seg); el = parent; depth++;
+              }
+              return path.join('>');
+            }
+            function scRecord(target) {
+              var k = scKey();
+              var bucket = scrollStore[k] || (scrollStore[k] = {});
+              if (!target || target === document || target === window ||
+                  target === document.documentElement) {
+                bucket.__win = window.scrollY || document.documentElement.scrollTop || 0;
+              } else if (target.scrollTop !== undefined &&
+                         target.scrollHeight > target.clientHeight + 4) {
+                bucket[scSelector(target)] = target.scrollTop;
+              }
+            }
+            var scThrottle = false;
+            window.addEventListener('scroll', function(e) {
+              if (scThrottle) return;
+              scThrottle = true; setTimeout(function(){ scThrottle = false; }, 120);
+              scRecord(e.target);
+            }, true);
+            function scRestore() {
+              var m = scrollStore[scKey()]; if (!m) return;
+              var tries = 0;
+              (function attempt() {
+                tries++;
+                if (m.__win != null) window.scrollTo(0, m.__win);
+                for (var sel in m) {
+                  if (sel === '__win') continue;
+                  try { var el = document.querySelector(sel); if (el) el.scrollTop = m[sel]; } catch (e) {}
+                }
+                if (tries < 16) setTimeout(attempt, 60);
+              })();
+            }
+            window.addEventListener('popstate', function() { setTimeout(scRestore, 40); });
+            window.addEventListener('pageshow', function() { setTimeout(scRestore, 40); });
+          } catch (e) {}
         })();
     """.trimIndent()
 
@@ -292,9 +477,37 @@ class MediaBrowserFragment : Fragment() {
                 drawerLayout.isDrawerOpen(GravityCompat.START) ->
                     drawerLayout.closeDrawer(GravityCompat.START)
                 currentTab?.webView?.canGoBack() == true ->
-                    currentTab?.webView?.goBack()
+                    currentTab?.let { goBackInTab(it) }
                 else -> findNavController().navigateUp()
             }
+        }
+    }
+
+    /**
+     * Go back one page, capturing the scroll offset we saved for the destination
+     * page so it can be restored once it finishes (re)loading. WebView restores
+     * scroll on its own only when the page comes from the back-forward cache;
+     * pages that reload from the network land at the top otherwise.
+     */
+    private fun goBackInTab(tab: BrowserTab) {
+        val wv = tab.webView
+        if (!wv.canGoBack()) return
+        val history = wv.copyBackForwardList()
+        val targetIndex = history.currentIndex - 1
+        tab.pendingRestoreY = if (targetIndex >= 0) {
+            tab.scrollPositions[history.getItemAtIndex(targetIndex).url]
+        } else null
+        wv.goBack()
+    }
+
+    /**
+     * Re-apply a saved scroll offset, retrying while the page content grows so we
+     * don't clamp to a not-yet-tall-enough document during progressive loading.
+     */
+    private fun restoreScroll(wv: WebView, targetY: Int, attempt: Int) {
+        wv.scrollTo(0, targetY)
+        if (wv.scrollY < targetY && attempt < 12) {
+            wv.postDelayed({ if (isAdded) restoreScroll(wv, targetY, attempt + 1) }, 60)
         }
     }
 
@@ -415,9 +628,18 @@ class MediaBrowserFragment : Fragment() {
     }
 
     private fun addToRecent(url: String, title: String?) {
+        // WebViews are kept alive in the ViewModel, so their onPageFinished can fire
+        // after this fragment has detached — touching prefs/views then would crash.
+        if (!isAdded) return
         val domain = extractDomain(url) ?: return
         if (domain == "about:blank" || domain.isBlank()) return
-        val siteUrl = "https://$domain"
+        // Keep the real host (with "www." if the page had it) in the clickable URL,
+        // otherwise "https://example.com" is saved for a site that only serves
+        // "https://www.example.com" and the favorite won't open. Display still uses
+        // the www-stripped domain.
+        val realHost = runCatching { URI(url).host }.getOrNull()?.takeIf { it.isNotBlank() } ?: domain
+        val scheme = runCatching { URI(url).scheme }.getOrNull()?.takeIf { it.isNotBlank() } ?: "https"
+        val siteUrl = "$scheme://$realHost"
         recentSites.removeAll { it.domain == domain }
         recentSites.add(0, SiteItem(siteUrl, domain, title?.takeIf { it.isNotBlank() } ?: domain))
         if (recentSites.size > MAX_RECENT) recentSites.removeAt(recentSites.lastIndex)
@@ -432,7 +654,7 @@ class MediaBrowserFragment : Fragment() {
     }
 
     private fun loadSitesFromPrefs() {
-        val prefs = PreferenceManager.getDefaultSharedPreferences(requireContext())
+        val prefs = PreferenceManager.getDefaultSharedPreferences(context ?: return)
         recentSites.clear()
         favoriteSites.clear()
         runCatching {
@@ -456,7 +678,7 @@ class MediaBrowserFragment : Fragment() {
     }
 
     private fun saveRecent() {
-        val prefs = PreferenceManager.getDefaultSharedPreferences(requireContext())
+        val prefs = PreferenceManager.getDefaultSharedPreferences(context ?: return)
         val arr = JSONArray()
         recentSites.forEach { s ->
             val obj = org.json.JSONObject()
@@ -469,7 +691,7 @@ class MediaBrowserFragment : Fragment() {
     }
 
     private fun saveFavorites() {
-        val prefs = PreferenceManager.getDefaultSharedPreferences(requireContext())
+        val prefs = PreferenceManager.getDefaultSharedPreferences(context ?: return)
         val arr = JSONArray()
         favoriteSites.forEach { s ->
             val obj = org.json.JSONObject()
@@ -518,11 +740,43 @@ class MediaBrowserFragment : Fragment() {
             fun onMediaFound(url: String) {
                 if (url.startsWith("http") && isLikelyMedia(url)) {
                     val wasEmpty = tab.interceptedUrls.isEmpty()
-                    tab.interceptedUrls.add(url)
+                    tab.interceptedUrls[url] = tab.url
                     if (wasEmpty && tab == currentTab) {
                         activity?.runOnUiThread { if (isAdded) setFabState(hasMedia = true) }
                     }
                 }
+            }
+
+            @JavascriptInterface
+            fun onManifestFound(url: String) {
+                // Verified by content (#EXTM3U) in JS, so bypass the extension check —
+                // sites disguise HLS playlists as .jpg to dodge downloaders.
+                if (!url.startsWith("http") || isAdHost(url)) return
+                val wasEmpty = tab.interceptedUrls.isEmpty()
+                tab.interceptedUrls[url] = tab.url
+                if (wasEmpty && tab == currentTab) {
+                    activity?.runOnUiThread { if (isAdded) setFabState(hasMedia = true) }
+                }
+            }
+
+            @JavascriptInterface
+            fun onImagesFound(json: String) {
+                try {
+                    val obj = JSONObject(json)
+                    val arr = obj.optJSONArray("images") ?: return
+                    if (arr.length() == 0) return
+                    val page = tab.url
+                    val set = tab.imageGroups.computeIfAbsent(page) { LinkedHashSet() }
+                    synchronized(set) {
+                        for (i in 0 until arr.length()) {
+                            arr.optString(i).takeIf { it.startsWith("http") }?.let { set.add(it) }
+                        }
+                    }
+                    obj.optString("title").takeIf { it.isNotBlank() }?.let { tab.imageTitles[page] = it }
+                    if (tab == currentTab) {
+                        activity?.runOnUiThread { if (isAdded) setFabState(hasMedia = true) }
+                    }
+                } catch (_: Exception) {}
             }
         }, "Android")
         refreshWebViewCallbacks(tab)
@@ -543,7 +797,10 @@ class MediaBrowserFragment : Fragment() {
                 val url = request?.url?.toString() ?: return null
                 if (isMediaUrl(url, request)) {
                     val wasEmpty = tab.interceptedUrls.isEmpty()
-                    tab.interceptedUrls.add(url)
+                    tab.interceptedUrls[url] = tab.url
+                    request.requestHeaders?.takeIf { it.isNotEmpty() }?.let {
+                        tab.mediaHeaders[url] = HashMap(it)
+                    }
                     if (wasEmpty && tab == currentTab) {
                         activity?.runOnUiThread { if (isAdded) setFabState(hasMedia = true) }
                     }
@@ -558,6 +815,9 @@ class MediaBrowserFragment : Fragment() {
                 // from previous pages doesn't appear in the download sheet.
                 if (!isReload && url != null && url != tab.url) {
                     tab.interceptedUrls.clear()
+                    tab.mediaHeaders.clear()
+                    tab.imageGroups.clear()
+                    tab.imageTitles.clear()
                     tab.url = url
                     if (tab == currentTab) {
                         activity?.runOnUiThread {
@@ -592,6 +852,12 @@ class MediaBrowserFragment : Fragment() {
                 url ?: return
                 tab.url = url
                 tab.interceptedUrls.clear()
+                tab.mediaHeaders.clear()
+                tab.imageGroups.clear()
+                tab.imageTitles.clear()
+                // Install the fetch/XHR hooks as early as possible so the very first
+                // API response (e.g. Douyin's aweme detail with the images) is caught.
+                view?.evaluateJavascript(OBSERVE_JS, null)
                 if (tab == currentTab) {
                     activity?.runOnUiThread {
                         if (!isAdded) return@runOnUiThread
@@ -620,6 +886,13 @@ class MediaBrowserFragment : Fragment() {
                 tabAdapter.notifyDataSetChanged()
                 wv.evaluateJavascript(OBSERVE_JS, null)
 
+                // If this load was a back navigation to a page that reloaded from
+                // scratch, WebView dropped us at the top — re-apply the saved offset.
+                tab.pendingRestoreY?.let { y ->
+                    tab.pendingRestoreY = null
+                    if (y > 0) restoreScroll(wv, y, 0)
+                }
+
                 if (url != null && url != "about:blank") {
                     addToRecent(url, tab.title)
                 }
@@ -633,6 +906,12 @@ class MediaBrowserFragment : Fragment() {
                     activity?.runOnUiThread { if (isAdded) tabAdapter.notifyDataSetChanged() }
                 }
             }
+        }
+
+        // Remember where the user was on each page so we can restore the browsing
+        // position after a back navigation (see goBackInTab / restoreScroll).
+        wv.setOnScrollChangeListener { _, _, scrollY, _, _ ->
+            (wv.url ?: tab.url).let { u -> if (u != "about:blank") tab.scrollPositions[u] = scrollY }
         }
 
         wv.setOnLongClickListener {
@@ -743,11 +1022,23 @@ class MediaBrowserFragment : Fragment() {
         return path.substringAfterLast('/').substringAfterLast('.', "")
     }
 
+    /**
+     * Path + query of a URL with scheme and host stripped, so a domain like
+     * "rou.video" doesn't false-match a path keyword like "video/" and flood the
+     * download list with every request the site makes (session, watching, …).
+     */
+    private fun urlPathPart(url: String): String {
+        val afterScheme = url.substringAfter("://", url)
+        val slash = afterScheme.indexOf('/')
+        return if (slash >= 0) afterScheme.substring(slash).lowercase() else ""
+    }
+
     private fun isMediaUrl(url: String, request: WebResourceRequest?): Boolean {
+        if (isAdHost(url)) return false
         val ext = urlExtension(url)
         if (ext in NON_MEDIA_EXTENSIONS) return false
         if (ext in MEDIA_EXTENSIONS) return true
-        if (MEDIA_KEYWORDS.any { url.lowercase().contains(it) }) return true
+        if (MEDIA_KEYWORDS.any { urlPathPart(url).contains(it) }) return true
         // Accept-header fallback: only when there is no extension at all
         // (extensionless streaming endpoints). Otherwise too many JS/CSS
         // requests carry "Accept: */*" or wildcard headers and slip through.
@@ -760,17 +1051,74 @@ class MediaBrowserFragment : Fragment() {
     }
 
     private fun isLikelyMedia(url: String): Boolean {
+        if (isAdHost(url)) return false
         val ext = urlExtension(url)
         if (ext in NON_MEDIA_EXTENSIONS) return false
         if (ext in MEDIA_EXTENSIONS) return true
-        return MEDIA_KEYWORDS.any { url.lowercase().contains(it) }
+        return MEDIA_KEYWORDS.any { urlPathPart(url).contains(it) }
+    }
+
+    /**
+     * A short token that uniquely distinguishes this media URL from others on the
+     * same page, so different videos never collapse to one shared filename.
+     * Tries, in order: an id-like path segment (e.g. a video id), the filename stem,
+     * then a stable short hash of the path — guaranteeing distinct URLs get distinct
+     * tokens even when the page title is identical for all of them.
+     */
+    private fun videoIdFromUrl(url: String): String {
+        val path = url.substringBefore('?').substringBefore('#')
+        val segments = path.split('/').filter { it.isNotBlank() }
+        // 1) longest id-like segment (has a digit, no dot, reasonable length)
+        segments.filter { it.length in 6..60 && !it.contains('.') && it.any { c -> c.isDigit() } }
+            .maxByOrNull { it.length }?.let { return it }
+        // 2) filename stem (URL-decoded), if it isn't a generic name
+        val stem = segments.lastOrNull()
+            ?.let { runCatching { java.net.URLDecoder.decode(it, "UTF-8") }.getOrDefault(it) }
+            ?.substringBeforeLast('.')?.takeIf {
+                it.isNotBlank() && it.lowercase() !in setOf("index", "video", "master", "playlist", "media")
+            }
+        if (stem != null) return stem.take(60)
+        // 3) stable short hash of the whole path
+        return Integer.toHexString(BrowserDownloadHistory.key(url).hashCode()).takeLast(6)
+    }
+
+    /**
+     * A human-readable filename embedded in the URL path, if any. For many sites the
+     * last path segment IS the real, unique title (e.g. ".../女儿的奶水 第05集【小苮儿】.mp3"),
+     * which beats the shared page <title>. Returns null for opaque/generic names
+     * (index/master, or hash-like ids) so callers fall back to the page title.
+     */
+    private fun urlFileNameTitle(url: String): String? {
+        val lastSeg = url.substringBefore('?').substringBefore('#').substringAfterLast('/')
+        if (lastSeg.isBlank()) return null
+        val decoded = runCatching { java.net.URLDecoder.decode(lastSeg, "UTF-8") }.getOrDefault(lastSeg)
+        val stem = decoded.substringBeforeLast('.').trim()
+        if (stem.isBlank()) return null
+        if (stem.lowercase() in setOf("index", "master", "playlist", "media", "video", "audio", "stream")) return null
+        // Reject opaque ids: long, all ASCII alphanumeric/-/_ with no spaces — not a real title.
+        val looksOpaque = stem.length >= 12 &&
+            stem.none { it.code > 127 } && stem.none { it == ' ' } &&
+            stem.all { it.isLetterOrDigit() || it == '-' || it == '_' }
+        if (looksOpaque) return null
+        return stem.take(120)
+    }
+
+    /** Build a per-item download title. Prefers a real filename in the URL (unique &
+     *  correct per item); otherwise page title plus a URL-derived token so multiple
+     *  items on one page still get distinct filenames instead of colliding. */
+    private fun mediaTitle(url: String, pageTitle: String?): String {
+        urlFileNameTitle(url)?.let { return it }
+        val base = pageTitle?.takeIf { it.isNotBlank() && it != "about:blank" && it != getString(R.string.new_tab) }
+        val id = videoIdFromUrl(url)
+        return if (base != null) "$base - $id" else id
     }
 
     private fun collectAndShowMedia() {
         val tab = currentTab ?: return
         tab.webView.evaluateJavascript(SCAN_JS) { result ->
             val merged = LinkedHashSet<String>()
-            tab.interceptedUrls.forEach { if (isLikelyMedia(it)) merged.add(it) }
+            // DOM-scanned media first, so the current page's own <video>/player
+            // source (usually first in document order) leads the list.
             runCatching {
                 val jsonString = JSONTokener(result?.trim() ?: "\"[]\"").nextValue() as? String ?: "[]"
                 val json = JSONArray(jsonString)
@@ -779,16 +1127,67 @@ class MediaBrowserFragment : Fragment() {
                     if (u.startsWith("http") && isLikelyMedia(u)) merged.add(u)
                 }
             }
-            val items = merged.map { toMediaItem(it) }
+            // Network-intercepted media, scoped to the current page. Entries are
+            // already vetted when added (isMediaUrl / isLikelyMedia / verified HLS),
+            // so don't re-filter by extension — that would drop .jpg-disguised m3u8.
+            tab.interceptedUrls.forEach { (mediaUrl, pageUrl) ->
+                if (pageUrl == tab.url) merged.add(mediaUrl)
+            }
+            // Dedupe by host/query-independent path, so the same video captured from
+            // a rotating CDN host with refreshed ?exp&auth tokens collapses to one
+            // entry (otherwise it looks like several videos that all download the
+            // same first one).
+            val seenKeys = HashSet<String>()
+            val dedupedMedia = merged.filter { seenKeys.add(BrowserDownloadHistory.key(it)) }
+            // Image-gallery posts (e.g. Douyin 图文) captured from aweme API responses.
+            val imageUrls = tab.imageGroups[tab.url]?.let { synchronized(it) { it.toList() } }.orEmpty()
+            val imageTitle = tab.imageTitles[tab.url]
+            val allItems = dedupedMedia.map { toMediaItem(it) } +
+                imageUrls.mapIndexed { idx, u -> toImageItem(u, idx) }
             val pageTitle = tab.title.takeIf { it.isNotBlank() && it != "about:blank" }
-            activity?.runOnUiThread { if (isAdded) showMediaSheet(items, pageTitle) }
+            activity?.runOnUiThread {
+                if (!isAdded) return@runOnUiThread
+                // Mark (don't hide) already-downloaded items: they stay visible and
+                // re-downloadable on tap, but are flagged so "download all" can skip
+                // them by default. Hiding entirely made the sheet look empty/broken.
+                val items = allItems.map {
+                    if (BrowserDownloadHistory.isDownloaded(requireContext(), it.url))
+                        it.copy(alreadyDownloaded = true) else it
+                }
+                showMediaSheet(items, pageTitle, imageTitle)
+            }
         }
+    }
+
+    private fun toImageItem(url: String, index: Int): MediaItem {
+        val ext = urlExtension(url).ifBlank { "jpg" }.take(6)
+        return MediaItem(
+            url = url,
+            filename = "${getString(R.string.image)} ${index + 1}",
+            extension = ext,
+            isAudio = false,
+            isImage = true
+        )
     }
 
     private fun toMediaItem(url: String): MediaItem {
         val path = url.substringBefore('?').substringBefore('#')
         val lastSegment = path.substringAfterLast('/')
         val ext = lastSegment.substringAfterLast('.', "").lowercase().take(6)
+        // Only real media reaches interceptedUrls (images use a separate path), so an
+        // image-extension entry here is a content-verified HLS playlist disguised as
+        // an image — label it as a video stream so the user knows what it is.
+        if (ext in setOf("jpg", "jpeg", "png", "webp", "gif", "bmp")) {
+            // Pull a resolution hint from the parent path segment (e.g. ".../<id>-720/index.jpg").
+            val parent = path.substringBeforeLast('/').substringAfterLast('/')
+            val res = Regex("-(\\d{3,4})(?:p)?$").find(parent)?.groupValues?.get(1)
+            return MediaItem(
+                url = url,
+                filename = getString(R.string.video) + (res?.let { " ${it}p" } ?: ""),
+                extension = "m3u8",
+                isAudio = false
+            )
+        }
         val decoded = runCatching { java.net.URLDecoder.decode(lastSegment, "UTF-8") }
             .getOrDefault(lastSegment)
         val filename = decoded.takeIf { it.isNotBlank() } ?: extractDomain(url) ?: url
@@ -800,11 +1199,14 @@ class MediaBrowserFragment : Fragment() {
         )
     }
 
-    private fun showMediaSheet(items: List<MediaItem>, pageTitle: String? = null) {
+    private fun showMediaSheet(items: List<MediaItem>, pageTitle: String? = null, imageTitle: String? = null) {
         if (items.isEmpty()) {
             Toast.makeText(requireContext(), R.string.no_media_found, Toast.LENGTH_SHORT).show()
             return
         }
+
+        val images = items.filter { it.isImage }
+        val media  = items.filter { !it.isImage }
 
         val view = layoutInflater.inflate(R.layout.bottomsheet_media_urls, null)
 
@@ -823,27 +1225,52 @@ class MediaBrowserFragment : Fragment() {
 
         view.findViewById<MaterialButton>(R.id.download_all_btn)?.setOnClickListener {
             dialog.dismiss()
-            downloadAllUrls(items.map { it.url })
+            // "Download all" skips items already downloaded (per the request to not
+            // re-download by default); tapping an item individually still re-downloads.
+            val direct = media.filter { isDirectFile(it.url) && !it.alreadyDownloaded }
+            val stream = media.filter { !isDirectFile(it.url) && !it.alreadyDownloaded }
+            val freshImages = images.filter { !it.alreadyDownloaded }
+            direct.forEach { downloadDirectFile(it.url, pageTitle) }
+            if (stream.isNotEmpty()) downloadAllUrls(stream.map { it.url })
+            if (freshImages.isNotEmpty()) downloadImages(freshImages.map { it.url }, imageTitle ?: pageTitle)
         }
         view.findViewById<MaterialButton>(R.id.download_one_by_one_btn)?.setOnClickListener {
             dialog.dismiss()
-            showOneByOneSheet(items)
+            showOneByOneSheet(items, imageTitle)
         }
-        view.findViewById<MaterialButton>(R.id.download_rules_btn)?.setOnClickListener {
-            dialog.dismiss()
-            showRulesDialog(items)
+        // "Download with rules" only applies to video/audio; hide it for pure image posts.
+        view.findViewById<MaterialButton>(R.id.download_rules_btn)?.apply {
+            isVisible = media.isNotEmpty()
+            setOnClickListener {
+                dialog.dismiss()
+                showRulesDialog(media)
+            }
         }
 
         val recycler = view.findViewById<RecyclerView>(R.id.media_url_list)
         recycler.layoutManager = LinearLayoutManager(requireContext())
         recycler.adapter = MediaUrlAdapter(items) { item ->
             dialog.dismiss()
-            downloadSingleUrl(item.url)
+            downloadMediaItem(item, imageTitle ?: pageTitle)
         }
         dialog.show()
     }
 
-    private fun showOneByOneSheet(items: List<MediaItem>) {
+    /**
+     * Route a single tapped item: images and progressive files download in-process
+     * immediately; streaming manifests (m3u8/mpd) go to yt-dlp.
+     */
+    private fun downloadMediaItem(item: MediaItem, imageTitle: String?) {
+        when {
+            item.isImage -> downloadImages(listOf(item.url), imageTitle)
+            isDirectFile(item.url) -> downloadDirectFile(item.url, imageTitle)
+            else -> downloadSingleUrl(item.url)
+        }
+    }
+
+    private fun isDirectFile(url: String) = urlExtension(url) in DIRECT_DOWNLOAD_EXTENSIONS
+
+    private fun showOneByOneSheet(items: List<MediaItem>, imageTitle: String? = null) {
         val view = layoutInflater.inflate(R.layout.bottomsheet_media_urls, null)
 
         view.findViewById<LinearLayout>(R.id.batch_actions)?.isVisible = false
@@ -856,7 +1283,7 @@ class MediaBrowserFragment : Fragment() {
         recycler.layoutManager = LinearLayoutManager(requireContext())
         recycler.adapter = MediaUrlAdapter(items) { item ->
             dialog.dismiss()
-            downloadSingleUrl(item.url)
+            downloadMediaItem(item, imageTitle)
         }
         dialog.show()
     }
@@ -899,14 +1326,46 @@ class MediaBrowserFragment : Fragment() {
     }
 
     private fun downloadAllUrlsWithType(urls: List<String>, type: DownloadType, worstQuality: Boolean) {
-        val items = urls.map { url ->
+        // Many CDNs (HLS streams, tokenized links) reject requests without the
+        // originating page as Referer, so pass the current page URL through to yt-dlp.
+        val referer = currentTab?.url?.takeIf { it.startsWith("http") && it != "about:blank" }
+        // For raw media URLs yt-dlp names the file after the URL basename (e.g.
+        // "index" for index.m3u8). Use the page title so the file matches the video;
+        // a non-blank DownloadItem.title makes yt-dlp rewrite %(title)s to it.
+        val pageTitle = currentTab?.title?.trim()
+            ?.takeIf { it.isNotBlank() && it != "about:blank" && it != getString(R.string.new_tab) }
+        val cookieManager = android.webkit.CookieManager.getInstance()
+        val items = urls.mapIndexed { i, url ->
             val item = downloadViewModel.createDownloadItemFromResult(
                 result    = downloadViewModel.createEmptyResultItem(url),
                 givenType = type
             )
             if (worstQuality) item.format.format_id = "worst"
+            if (referer != null && !item.extraCommands.contains("--referer")) {
+                item.extraCommands = "${item.extraCommands} --referer \"$referer\"".trim()
+            }
+            // Token-gated CDNs (e.g. Cloudflare-protected HLS) often authorize via a
+            // cookie set on the media host during playback. Forward the WebView's
+            // cookies for that host so yt-dlp's manifest + segment requests pass.
+            val cookie = cookieManager.getCookie(url)?.trim()?.takeIf { it.isNotBlank() }
+            if (cookie != null && !item.extraCommands.contains("Cookie:")) {
+                val safe = cookie.replace("\"", "")
+                item.extraCommands = "${item.extraCommands} --add-header \"Cookie:$safe\"".trim()
+            }
+            // Replay any token/auth headers the page used when it fetched this media,
+            // so CDNs that gate on a per-request header still authorize yt-dlp.
+            currentTab?.mediaHeaders?.get(url)?.forEach { (k, v) ->
+                val kl = k.lowercase()
+                if (kl !in SKIP_REPLAY_HEADERS && v.isNotBlank() && !item.extraCommands.contains("$k:")) {
+                    item.extraCommands = "${item.extraCommands} --add-header \"$k:${v.replace("\"", "")}\"".trim()
+                }
+            }
+            // Per-video title (page title + the URL's own id) so different videos on
+            // one page get distinct filenames instead of all overwriting each other.
+            item.title = mediaTitle(url, pageTitle)
             item
         }
+        BrowserDownloadHistory.markDownloaded(requireContext(), urls)
         lifecycleScope.launch(Dispatchers.IO) {
             downloadViewModel.queueDownloads(items)
             withContext(Dispatchers.Main) {
@@ -917,6 +1376,70 @@ class MediaBrowserFragment : Fragment() {
                 ).show()
             }
         }
+    }
+
+    /**
+     * Download plain images (e.g. a Douyin 图文 gallery) directly, off the yt-dlp path.
+     * Runs in a WorkManager worker with the page's Referer/Cookie/UA so signed image
+     * CDNs still authorize, and saves into the gallery.
+     */
+    private fun downloadImages(urls: List<String>, title: String?) {
+        if (urls.isEmpty()) return
+        val referer = currentTab?.url?.takeIf { it.startsWith("http") } ?: "https://www.douyin.com/"
+        val cookie  = urls.firstOrNull()
+            ?.let { android.webkit.CookieManager.getInstance().getCookie(it) } ?: ""
+        val ua = currentTab?.webView?.settings?.userAgentString ?: ""
+        val data = Data.Builder()
+            .putStringArray(ImageDownloadWorker.KEY_URLS, urls.toTypedArray())
+            .putString(ImageDownloadWorker.KEY_TITLE, title?.takeIf { it.isNotBlank() })
+            .putString(ImageDownloadWorker.KEY_REFERER, referer)
+            .putString(ImageDownloadWorker.KEY_COOKIE, cookie)
+            .putString(ImageDownloadWorker.KEY_USER_AGENT, ua)
+            .build()
+        WorkManager.getInstance(requireContext()).enqueue(
+            OneTimeWorkRequestBuilder<ImageDownloadWorker>().setInputData(data).build()
+        )
+        BrowserDownloadHistory.markDownloaded(requireContext(), urls)
+        Toast.makeText(
+            requireContext(),
+            "${urls.size} ${getString(R.string.downloading)}",
+            Toast.LENGTH_SHORT
+        ).show()
+    }
+
+    /**
+     * Download a single progressive media file immediately via OkHttp (off the yt-dlp
+     * queue), replaying the page's Referer/Cookie/User-Agent and the exact request
+     * headers the WebView used — the best shot at beating short-lived signed URLs.
+     */
+    private fun downloadDirectFile(url: String, title: String?) {
+        val referer = currentTab?.url?.takeIf { it.startsWith("http") && it != "about:blank" } ?: ""
+        val cookie  = android.webkit.CookieManager.getInstance().getCookie(url) ?: ""
+        val ua = currentTab?.webView?.settings?.userAgentString ?: ""
+        val fileTitle = mediaTitle(url, title ?: currentTab?.title)
+        val headerJson = JSONObject().apply {
+            currentTab?.mediaHeaders?.get(url)?.forEach { (k, v) ->
+                if (k.lowercase() !in SKIP_REPLAY_HEADERS && v.isNotBlank()) put(k, v)
+            }
+        }.toString()
+        val data = Data.Builder()
+            .putString(DirectDownloadWorker.KEY_URL, url)
+            .putString(DirectDownloadWorker.KEY_TITLE, fileTitle)
+            .putString(DirectDownloadWorker.KEY_REFERER, referer)
+            .putString(DirectDownloadWorker.KEY_COOKIE, cookie)
+            .putString(DirectDownloadWorker.KEY_USER_AGENT, ua)
+            .putString(DirectDownloadWorker.KEY_HEADERS, headerJson)
+            .putBoolean(DirectDownloadWorker.KEY_IS_AUDIO, urlExtension(url) in AUDIO_EXTENSIONS)
+            .build()
+        WorkManager.getInstance(requireContext()).enqueue(
+            OneTimeWorkRequestBuilder<DirectDownloadWorker>().setInputData(data).build()
+        )
+        BrowserDownloadHistory.markDownloaded(requireContext(), listOf(url))
+        Toast.makeText(
+            requireContext(),
+            "1 ${getString(R.string.downloading)}",
+            Toast.LENGTH_SHORT
+        ).show()
     }
 
     // ── Inner adapters ────────────────────────────────────────────────────────
@@ -1001,7 +1524,9 @@ class MediaBrowserFragment : Fragment() {
         val url: String,
         val filename: String,
         val extension: String,
-        val isAudio: Boolean
+        val isAudio: Boolean,
+        val isImage: Boolean = false,
+        val alreadyDownloaded: Boolean = false
     )
 
     private inner class MediaUrlAdapter(
@@ -1025,12 +1550,17 @@ class MediaBrowserFragment : Fragment() {
 
         override fun onBindViewHolder(holder: VH, position: Int) {
             val item = items[position]
-            holder.filename.text = item.filename
+            // Flag already-downloaded items with a check so the user can tell (still tappable to re-download).
+            holder.filename.text = if (item.alreadyDownloaded) "✓ ${item.filename}" else item.filename
+            holder.itemView.alpha = if (item.alreadyDownloaded) 0.5f else 1f
             holder.ext.text = item.extension
             holder.url.text = extractDomain(item.url) ?: item.url
             holder.icon.setImageResource(
-                if (item.isAudio) R.drawable.baseline_audio_file_24
-                else R.drawable.baseline_video_file_24
+                when {
+                    item.isImage -> R.drawable.ic_image
+                    item.isAudio -> R.drawable.baseline_audio_file_24
+                    else         -> R.drawable.baseline_video_file_24
+                }
             )
             holder.itemView.setOnClickListener { onClick(item) }
             holder.btn.setOnClickListener { onClick(item) }

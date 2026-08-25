@@ -526,6 +526,9 @@
     <string name="no_media_found">暂未发现媒体资源</string>
     <string name="media_url_item_label">点击下载</string>
     <string name="detected_media_urls">资源</string>
+    <string name="image">图片</string>
+    <string name="downloads_finished">下载完成</string>
+    <string name="already_downloaded">已下载过</string>
     <string name="forward">前进</string>
     <string name="reload">刷新</string>
     <string name="pages">网页</string>
